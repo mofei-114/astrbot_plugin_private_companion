@@ -12,10 +12,11 @@ from .management import MemoryManagement
 from .models import owner_key, timestamp
 
 
-# Refusals where nothing ran and the original reservation is still intact.
-# The supervisor leaves the row queued for a transient capacity or cache
-# condition, so the continuation must re-queue instead of settling as blocked:
-# only `advance()` picks `queued` rows back up, a blocked row never retries.
+# This owner's retry policy: refusals that left nothing running and may simply
+# clear on their own. Only `advance()` picks `queued` rows back up, so a blocked
+# row never retries. Deliberately not the same list as
+# `execution.runner.CAPACITY_REFUSALS`: that one decides what the runner keeps
+# queued, this one decides what this job tries again.
 RETRYABLE = ("memory_index_busy", "memory_index_unavailable", "task_queue_full",
              "memory_task_worker_not_stopped", "task_lane_full", "task_concurrency_limited")
 

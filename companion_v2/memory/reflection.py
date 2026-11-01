@@ -58,7 +58,13 @@ class MemoryReflection:
             raise ValueError("memory reflection must attach once to its original runtime")
         self.memory, self.gateway, self.tasks = memory, gateway, gateway.tasks
         self._require_running = require_running
-        self.runner = ExactTaskRunner(self.tasks, frozenset({KIND}), self._generate)
+        # Retain capacity refusals: MemoryReflectionJobs own this row's
+        # convergence by ID (they re-queue on the refusal code and retry), so a
+        # momentarily full lane must not retire the reservation.
+        # `runner.CAPACITY_REFUSALS` is the execution-layer notion of "capacity";
+        # `reflection_jobs.RETRYABLE` is this owner's retry policy. They answer
+        # different questions and are deliberately not the same constant.
+        self.runner = ExactTaskRunner(self.tasks, frozenset({KIND}), self._generate, retain_refusals=True)
 
     def _sequence(self, context):
         return self.runtime.read_one("SELECT COALESCE(MAX(sequence), 0) n FROM memory_changes WHERE owner_key = ?", (owner_key(context),))["n"]

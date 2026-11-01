@@ -51,9 +51,9 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
         self.tasks.attach(expected_generation=1).unwrap()
         return self.tasks
 
-    def runner(self, kind, handler, *, waiting=None):
-        runner = ExactTaskRunner(self.tasks, frozenset({kind}), handler,
-                                 check_interval=0.005, stop_grace=0.05, waiting=waiting)
+    def runner(self, kind, handler, *, waiting=None, retain_refusals=False):
+        runner = ExactTaskRunner(self.tasks, frozenset({kind}), handler, check_interval=0.005,
+                                 stop_grace=0.05, waiting=waiting, retain_refusals=retain_refusals)
         self.addAsyncCleanup(runner.close)
         return runner
 
@@ -74,16 +74,33 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
         self.submit("holder", kind="fixture.background")
         self.tasks.begin(self.claim(Lane.BACKGROUND)).unwrap()
         self.submit("blocked", kind="fixture.background")
-        result = (await self.runner("fixture.background", handler).run(self.context, "blocked")).unwrap()
+        runner = self.runner("fixture.background", handler, retain_refusals=True)
+        result = (await runner.run(self.context, "blocked")).unwrap()
         self.assertEqual(calls, [])
-        # Nothing ran, so this is never an owner result. A full lane is a
-        # transient refusal: the supervisor left the row queued on purpose and
-        # the owner still holds and waits for it by ID, so retiring it here would
-        # turn a momentary shortage into a permanent loss. The refusal is named
-        # instead, which keeps "not executed" visible to the owner's retry policy.
+        # Nothing ran, so this is never an owner result. A retaining owner opted
+        # in to converging the row by ID, so a momentarily full lane keeps the
+        # reservation instead of turning a shortfall into a permanent loss.
         self.assertEqual((result.task.state, result.task.reason), ("created", "queued"))
         self.assertEqual((result.failure_code, result.refused), ("task_lane_full", "task_lane_full"))
         self.assertEqual(self.ledger("blocked"), ("created", "queued"))
+
+    async def test_default_runner_still_retires_a_full_lane_reservation(self):
+        calls = []
+
+        async def handler(run):
+            calls.append(run.task.task_id)
+            return TaskResult("succeeded")
+
+        self.attached()
+        self.submit("holder", kind="fixture.background")
+        self.tasks.begin(self.claim(Lane.BACKGROUND)).unwrap()
+        self.submit("blocked", kind="fixture.background")
+        # Retaining is an explicit opt-in: an owner without an ID-convergence
+        # policy must not inherit a queued row it would never look at again.
+        result = (await self.runner("fixture.background", handler).run(self.context, "blocked")).unwrap()
+        self.assertEqual(calls, [])
+        self.assertEqual((result.task.state, result.failure_code), ("cancelled", "task_lane_full"))
+        self.assertEqual(self.ledger("blocked"), ("cancelled", "task_lane_full"))
 
     async def test_owner_validation_refusal_is_reported_instead_of_success(self):
         calls = []
@@ -152,8 +169,38 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
         with self.assertRaises(ValueError):
             replace(refused, claim=TaskClaim("blocked", "attempt", 1))
 
+    async def test_refusal_code_matrix_decides_whether_the_row_survives(self):
+        """Only capacity refusals may be kept, and only for an opted-in owner."""
+        calls = []
+        capacity = ("task_lane_full", "task_concurrency_limited")
+        row_refusals = ("task_not_due", "task_not_queued", None)
+
+        async def handler(run):
+            calls.append(run.task.task_id)
+            return TaskResult("succeeded")
+
+        for retained in (True, False):
+            for code in capacity + row_refusals:
+                with self.subTest(retain_refusals=retained, code=code):
+                    task_id = "refused-" + retained.__str__() + "-" + str(code)
+                    self.attached()
+                    self.submit(task_id, kind=self.background.kind)
+                    runner = self.runner(self.background.kind, handler, retain_refusals=retained)
+                    with patch.object(self.tasks, "claim_task",
+                                      return_value=Outcome.success(ClaimResult(None, code))):
+                        result = (await runner.run(self.context, task_id)).unwrap()
+                    keep = retained and code in capacity
+                    self.assertEqual(calls, [])
+                    self.assertEqual(result.task.state, "created" if keep else "cancelled")
+                    self.assertEqual(result.failure_code, code or "task_not_admitted")
+                    if keep:
+                        # A kept row reports the reservation and the refusal together.
+                        self.assertEqual(result.refused, code)
+                    self.assertEqual(self.ledger(task_id), ("created", "queued") if keep else
+                                     ("cancelled", code or "task_not_admitted"))
+
     async def test_unnamed_queued_refusal_is_still_retired_not_kept(self):
-        """Only a named transient refusal keeps the row; silence keeps retiring."""
+        """A retaining owner still gives up on a refusal that names no capacity."""
         calls = []
 
         async def handler(run):
@@ -162,7 +209,7 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
 
         self.attached()
         self.submit("pending", kind=self.background.kind)
-        runner = self.runner(self.background.kind, handler)
+        runner = self.runner(self.background.kind, handler, retain_refusals=True)
         # An unnamed non-claim keeps the legacy cleanup: the reservation is gone.
         with patch.object(self.tasks, "claim_task",
                           return_value=Outcome.success(ClaimResult(None))):
@@ -183,9 +230,10 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
         held = self.claim(Lane.BACKGROUND)
         self.tasks.begin(held).unwrap()
         self.submit("blocked", kind="fixture.background")
-        runner = self.runner("fixture.background", handler)
+        runner = self.runner("fixture.background", handler, retain_refusals=True)
         self.assertEqual((await runner.run(self.context, "blocked")).unwrap().failure_code, "task_lane_full")
         self.assertEqual(calls, [])
+        self.assertEqual(self.ledger("blocked"), ("created", "queued"))
         self.tasks.finish(held, TaskResult("succeeded")).unwrap()
         self.assertEqual((await runner.run(self.context, "blocked")).unwrap().task.state, "succeeded")
         self.assertEqual(calls, ["blocked"])
