@@ -295,7 +295,6 @@ class MemoryReflectionJobsTests(HostFixture, unittest.IsolatedAsyncioTestCase):
         final = await self.settle(app, job["job_id"])
         self.assertEqual(final["state"], "complete", final)
         self.assertEqual(self.row(app, batch)["state"], "complete")
-        self.assertEqual(self.row(app, batch)["state"], "complete")
 
     async def occupy_lane(self, app, context, holder_batch):
         """Hold the single background slot with a real begun attempt that never finishes."""

@@ -16,6 +16,7 @@ result, never about internal call counts alone.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import unittest
 from dataclasses import replace
@@ -179,25 +180,53 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
             calls.append(run.task.task_id)
             return TaskResult("succeeded")
 
-        for retained in (True, False):
-            for code in capacity + row_refusals:
-                with self.subTest(retain_refusals=retained, code=code):
-                    task_id = "refused-" + retained.__str__() + "-" + str(code)
-                    self.attached()
-                    self.submit(task_id, kind=self.background.kind)
-                    runner = self.runner(self.background.kind, handler, retain_refusals=retained)
-                    with patch.object(self.tasks, "claim_task",
-                                      return_value=Outcome.success(ClaimResult(None, code))):
-                        result = (await runner.run(self.context, task_id)).unwrap()
-                    keep = retained and code in capacity
-                    self.assertEqual(calls, [])
-                    self.assertEqual(result.task.state, "created" if keep else "cancelled")
-                    self.assertEqual(result.failure_code, code or "task_not_admitted")
-                    if keep:
-                        # A kept row reports the reservation and the refusal together.
-                        self.assertEqual(result.refused, code)
-                    self.assertEqual(self.ledger(task_id), ("created", "queued") if keep else
-                                     ("cancelled", code or "task_not_admitted"))
+        for index, (retained, code) in enumerate(
+                itertools.product((True, False), capacity + row_refusals)):
+            with self.subTest(retain_refusals=retained, code=code):
+                task_id = "refused-" + str(index)
+                self.attached()
+                self.submit(task_id, kind=self.background.kind)
+                runner = self.runner(self.background.kind, handler, retain_refusals=retained)
+                with patch.object(self.tasks, "claim_task",
+                                  return_value=Outcome.success(ClaimResult(None, code))):
+                    result = (await runner.run(self.context, task_id)).unwrap()
+                keep = retained and code in capacity
+                self.assertEqual(calls, [])
+                self.assertEqual(result.task.state, "created" if keep else "cancelled")
+                self.assertEqual(result.failure_code, code or "task_not_admitted")
+                if keep:
+                    # A kept row reports the reservation and the refusal together.
+                    self.assertEqual(result.refused, code)
+                else:
+                    # A retired row names its cause in `failure_code` only.
+                    self.assertIsNone(result.refused)
+                self.assertEqual(self.ledger(task_id), ("created", "queued") if keep else
+                                 ("cancelled", code or "task_not_admitted"))
+
+    async def test_retained_refusal_never_revives_a_row_that_is_already_settled(self):
+        """A cancelled row wins over the refusal: the runner neither keeps nor re-retires it."""
+        calls = []
+
+        async def handler(run):
+            calls.append(run.task.task_id)
+            return TaskResult("succeeded")
+
+        self.attached()
+        saved = self.submit("cancelled", kind=self.background.kind)
+        self.tasks.cancel(self.context, "cancelled", expected_revision=saved.revision).unwrap()
+        self.assertEqual(self.ledger("cancelled"), ("cancelled", "cancelled_before_start"))
+        runner = self.runner(self.background.kind, handler, retain_refusals=True)
+        with patch.object(self.tasks, "claim_task",
+                          return_value=Outcome.success(ClaimResult(None, "task_lane_full"))):
+            result = (await runner.run(self.context, "cancelled")).unwrap()
+        self.assertEqual(calls, [])
+        # The row's own state is authoritative: the settled row wins over the
+        # refusal, so nothing is kept and nothing is re-retired. The pre-existing
+        # early exit reports the row's own reason, never the refused code.
+        self.assertEqual(result.task.state, "cancelled")
+        self.assertEqual(result.failure_code, "cancelled_before_start")
+        self.assertIsNone(result.refused)
+        self.assertEqual(self.ledger("cancelled"), ("cancelled", "cancelled_before_start"))
 
     async def test_unnamed_queued_refusal_is_still_retired_not_kept(self):
         """A retaining owner still gives up on a refusal that names no capacity."""
