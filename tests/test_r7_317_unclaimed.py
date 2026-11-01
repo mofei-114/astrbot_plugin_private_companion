@@ -22,9 +22,10 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from companion_v2.configuration.registry import FieldRegistry
-from companion_v2.execution.models import Lane, TaskClaim, TaskContext, TaskResult, digest
+from companion_v2.execution.models import ClaimResult, Lane, TaskClaim, TaskContext, TaskResult, digest
 from companion_v2.execution.runner import ExactTaskRunner
 from companion_v2.execution.waiting import BackgroundTaskQueue
+from companion_v2.foundation.outcome import Outcome
 from companion_v2.foundation.refs import AudienceRef, ReferenceValidationError, RoleOwnerRef
 from companion_v2.model_gateway.routing import configuration_fields
 from companion_v2.role_work.journal import JournalContext, JournalKey, JournalKind
@@ -75,9 +76,14 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
         self.submit("blocked", kind="fixture.background")
         result = (await self.runner("fixture.background", handler).run(self.context, "blocked")).unwrap()
         self.assertEqual(calls, [])
-        self.assertEqual(result.task.state, "cancelled")
-        self.assertEqual(result.failure_code, "task_lane_full")
-        self.assertEqual(self.ledger("blocked"), ("cancelled", "task_lane_full"))
+        # Nothing ran, so this is never an owner result. A full lane is a
+        # transient refusal: the supervisor left the row queued on purpose and
+        # the owner still holds and waits for it by ID, so retiring it here would
+        # turn a momentary shortage into a permanent loss. The refusal is named
+        # instead, which keeps "not executed" visible to the owner's retry policy.
+        self.assertEqual((result.task.state, result.task.reason), ("created", "queued"))
+        self.assertEqual((result.failure_code, result.refused), ("task_lane_full", "task_lane_full"))
+        self.assertEqual(self.ledger("blocked"), ("created", "queued"))
 
     async def test_owner_validation_refusal_is_reported_instead_of_success(self):
         calls = []
@@ -145,6 +151,45 @@ class UnclaimedExactTaskTests(ExecutionFixture, unittest.IsolatedAsyncioTestCase
         self.assertEqual(self.ledger("blocked"), ("created", "queued"))
         with self.assertRaises(ValueError):
             replace(refused, claim=TaskClaim("blocked", "attempt", 1))
+
+    async def test_unnamed_queued_refusal_is_still_retired_not_kept(self):
+        """Only a named transient refusal keeps the row; silence keeps retiring."""
+        calls = []
+
+        async def handler(run):
+            calls.append(run.task.task_id)
+            return TaskResult("succeeded")
+
+        self.attached()
+        self.submit("pending", kind=self.background.kind)
+        runner = self.runner(self.background.kind, handler)
+        # An unnamed non-claim keeps the legacy cleanup: the reservation is gone.
+        with patch.object(self.tasks, "claim_task",
+                          return_value=Outcome.success(ClaimResult(None))):
+            result = (await runner.run(self.context, "pending")).unwrap()
+        self.assertEqual(calls, [])
+        self.assertEqual((result.task.state, result.failure_code), ("cancelled", "task_not_admitted"))
+        self.assertEqual(self.ledger("pending"), ("cancelled", "task_not_admitted"))
+
+    async def test_retained_reservation_still_runs_once_the_lane_frees_up(self):
+        calls = []
+
+        async def handler(run):
+            calls.append(run.task.task_id)
+            return TaskResult("succeeded")
+
+        self.attached()
+        self.submit("holder", kind="fixture.background")
+        held = self.claim(Lane.BACKGROUND)
+        self.tasks.begin(held).unwrap()
+        self.submit("blocked", kind="fixture.background")
+        runner = self.runner("fixture.background", handler)
+        self.assertEqual((await runner.run(self.context, "blocked")).unwrap().failure_code, "task_lane_full")
+        self.assertEqual(calls, [])
+        self.tasks.finish(held, TaskResult("succeeded")).unwrap()
+        self.assertEqual((await runner.run(self.context, "blocked")).unwrap().task.state, "succeeded")
+        self.assertEqual(calls, ["blocked"])
+        self.assertEqual(self.ledger("blocked"), ("succeeded", "owner_result"))
 
     async def test_discard_records_the_owner_supplied_cause(self):
         self.attached()

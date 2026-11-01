@@ -7,8 +7,9 @@ import json
 import unittest
 from unittest.mock import patch
 
-from companion_v2.execution.models import encode, stamp
+from companion_v2.execution.models import ClaimResult, encode, stamp
 from companion_v2.execution.models import TaskError
+from companion_v2.foundation.outcome import Outcome
 from companion_v2.configuration.registry import FieldRegistry
 from companion_v2.memory.reflection import reflection_profile
 from companion_v2.memory.reflection_management import ReflectionManagement
@@ -219,6 +220,45 @@ class MemoryReflectionJobsTests(HostFixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(self.called), calls)
             self.assertFalse(app.memory_schedule.continuations.active_handles)
         self.assertEqual((await self.settle(app, job["job_id"]))["state"], "complete")
+
+    async def test_saturated_background_lane_re_queues_instead_of_blocking_the_repair(self):
+        app, context = await self.cold()
+        batch = self.prepare(app, context)["batch_id"]
+        job = self.enqueue(app, context, batch).unwrap()
+        calls, claims = len(self.called), []
+        original = app.tasks.claim_task
+
+        def saturated_lane(ctx, task_id):
+            # Selection is local work; the model claim meets a full background lane.
+            if task_id.startswith("memory-extract-task-"):
+                claims.append(task_id)
+                return Outcome.success(ClaimResult(None, "task_lane_full"))
+            return original(ctx, task_id)
+
+        with patch.object(app.tasks, "claim_task", side_effect=saturated_lane):
+            # Selection advances over several wakes; the first model claim is refused.
+            for _ in range(30):
+                if claims:
+                    break
+                app.memory_schedule.continuations.advance(1)
+                if app.memory_schedule.continuations.workers:
+                    worker = next(iter(app.memory_schedule.continuations.workers.values()))[1]
+                    await worker
+                await self.until(lambda: not app.memory_schedule.continuations.active_handles)
+                if not claims:
+                    self.advance(app, 5)
+            self.assertEqual(len(claims), 1)
+            value = self.job(app, job["job_id"])
+            self.assertEqual((value["state"], value["result_code"]), ("queued", "task_lane_full"))
+            self.assertEqual(value["next_at"], stamp(self.clock.now() + timedelta(seconds=5)))
+            self.assertEqual(len(self.called), calls)
+            self.assertFalse(app.memory_schedule.continuations.active_handles)
+            # The refusal left the original reservation queued, not retired.
+            self.assertEqual(self.row(app, batch)["state"], "prepared")
+        # The next due wake re-enters the same job and finishes it.
+        final = await self.settle(app, job["job_id"])
+        self.assertEqual(final["state"], "complete", final)
+        self.assertEqual(len(self.called), calls + 1)
 
     async def test_auto_repair_child_survives_multiple_selection_steps(self):
         app, context = await self.cold()

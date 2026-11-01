@@ -12,6 +12,14 @@ from .management import MemoryManagement
 from .models import owner_key, timestamp
 
 
+# Refusals where nothing ran and the original reservation is still intact.
+# The supervisor leaves the row queued for a transient capacity or cache
+# condition, so the continuation must re-queue instead of settling as blocked:
+# only `advance()` picks `queued` rows back up, a blocked row never retries.
+RETRYABLE = ("memory_index_busy", "memory_index_unavailable", "task_queue_full",
+             "memory_task_worker_not_stopped", "task_lane_full", "task_concurrency_limited")
+
+
 def describe_job(row):
     return {key: row[key] for key in ("job_id", "batch_id", "state", "next_at", "result_code", "created_at", "updated_at")}
 
@@ -114,7 +122,7 @@ class MemoryReflectionJobs:
                     code = "memory_reflection_uncertain" if current["state"] == "running" else "memory_reflection_failed"
             else:
                 code = result.failure.code
-                if code in ("memory_index_busy", "memory_index_unavailable", "task_queue_full", "memory_task_worker_not_stopped"):
+                if code in RETRYABLE:
                     state, delay = "queued", 5
         except TaskError as error:
             code = error.code

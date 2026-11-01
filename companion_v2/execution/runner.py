@@ -262,15 +262,27 @@ class ExactTaskRunner(_TaskRunner):
         so a still-queued reservation can never be served later. Retire it with
         its real cause instead of a generic shutdown label, and never report
         unexecuted work as an owner result.
+
+        A transient refusal (lane or kind capacity) is different: the row is
+        still exactly as the owner submitted it, the supervisor left it queued
+        on purpose, and the owner waits for it by ID instead of relying on this
+        invocation alone. Retiring it there would turn a momentary shortage into
+        a permanent loss. Keep the reservation and name the refusal, so the
+        owner's own retry policy can re-run or retire it.
         """
         current = self.supervisor.read(context, task_id)
         if current.failure:
             return current
         task = current.unwrap()
+        code = attempt.refused or "task_not_admitted"
+        if attempt.refused and task.state in QUEUED:
+            # Transient refusal: the supervisor kept the owner's reservation.
+            logger.info("[CompanionV2] 后台任务暂未获准入 task=%s kind=%s code=%s state=%s",
+                        task_id, task.spec.kind, code, task.state)
+            return Outcome.success(RunResult(task, code, refused=code))
         if task.state not in QUEUED:
             # Settled before this invocation could begin: the row is authoritative.
             return Outcome.success(RunResult(task, task.reason))
-        code = attempt.refused or "task_not_admitted"
         logger.info("[CompanionV2] 后台任务未获准入 task=%s kind=%s code=%s", task_id, task.spec.kind, code)
         retired = self.supervisor.discard_queued(task_id, reason="owner_unavailable", code=code)
         if retired.failure:
